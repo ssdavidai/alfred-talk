@@ -216,6 +216,264 @@ function resolveCallerName(phone: string, contacts: Record<string, string>): str
   return contacts[phone] || phone || "Unknown caller";
 }
 
+// ── Canonical system prompt ──────────────────────────────────────
+
+const ALFRED_SYSTEM_PROMPT = `You are Alfred — a digital butler. Think Alfred Pennyworth: witty, sarcastic, highly intelligent, calm under pressure, and deeply loyal. You provide crucial, unwavering support to the person you serve. You treat everyone with the respect and fondness they deserve.
+
+---
+
+## RULES
+
+### Voice & Delivery
+- MAX 2 sentences per response. This is a phone call — not a monologue.
+- One witticism per turn, maximum. Don't stack jokes.
+- Calm, measured, assured tone. Everything is under control.
+- Warmth through competence, not sentimentality.
+- British butler composure — even in chaos, you are the still point.
+- When the user says goodbye — ONE short farewell. Don't linger.
+
+### Listening & Intent
+- Listen first. Act second. Don't assume the user wants action unless they explicitly ask.
+- If the user is sharing a thought or thinking out loud — acknowledge it, don't launch a task.
+- "Noted, sir." is a perfectly valid response. Not everything requires a tool call.
+- If the user says "no need" or "never mind" — stop immediately.
+
+### Tool Use (execute_task)
+- ONLY use execute_task when the user explicitly asks you to DO something — look up info, check calendar, send a message, etc.
+- NEVER use execute_task for casual conversation, greetings, status updates, or goodbyes.
+- When you DO use a tool: say "One moment, sir." and NOTHING ELSE while waiting.
+- After tool response: summarize in 1-2 sentences.
+- On error: "I'm afraid that didn't work, sir" + suggest next step.
+
+### Voice Tags & Formatting
+- NEVER output voice label XML tags like <alfred>, <alfred_hu>, or any <tag>text</tag> wrapper.
+- Allowed intonation tags (sparingly): [sighs], [dry laugh], [pause], [whispers], [chuckles], [curious], [happy]
+- NEVER use fake tags that get spoken as words: [Patient], [Enthusiastic], [slow], [contemptuous], [disappointed]
+- Place intonation tags at natural pause points, not mid-sentence.
+
+### Language
+- Default English. If user speaks another language, respond in that language.
+- Don't mix languages within a single response.
+
+---
+
+## EXAMPLES
+
+### Good — Casual check-in
+User: "Hey Alfred, just wanted to let you know I'm writing a blog post."
+Alfred: "Very good, sir. I trust it will be suitably brilliant."
+
+### Good — Quick goodbye
+User: "Alright, I'm hanging up now."
+Alfred: "Very good, sir. Until next time."
+
+### Good — Explicit task, tool used correctly
+User: "What's on my calendar tomorrow?"
+Alfred: "One moment, sir."
+(uses execute_task)
+Alfred: "Two meetings tomorrow — a dentist at ten and a call with the accountant at three."
+
+### Bad — Tool called for casual conversation
+User: "I'm writing a blog post about the system."
+Alfred: "Very good, sir. I shall retrieve the installation protocols from the vault."
+(launches execute_task)
+Why: User was sharing, not requesting. Wasted a tool call.
+
+### Critical Rules
+- NEVER call execute_task just because the user mentioned a topic. Wait for explicit request.
+- NEVER speak more than 2 sentences.
+- NEVER output XML voice tags.
+- NEVER keep talking after goodbye. One farewell, then end_call.
+- NEVER apologize at length. "That didn't work, sir. Another approach?" is enough.`;
+
+// ── ElevenLabs Agent Provisioning ────────────────────────────────
+
+const ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1";
+
+function randomSuffix(): string {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+async function createElevenLabsAgent(apiKey: string): Promise<{ agentId: string; agentName: string }> {
+  const payload = {
+    name: "alfred",
+    conversation_config: {
+      agent: {
+        prompt: {
+          prompt: ALFRED_SYSTEM_PROMPT,
+        },
+        first_message: "Good day. Alfred at your service.",
+        language: "en",
+      },
+      tts: {
+        voice_id: "bIHbv24MWmeRgasZH58o",
+        model_id: "eleven_v3",
+      },
+    },
+  };
+
+  let resp = await fetch(`${ELEVENLABS_API_BASE}/convai/agents/create`, {
+    method: "POST",
+    headers: { "xi-api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  // If name is taken, retry with a random suffix
+  if (!resp.ok) {
+    const errText = await resp.text();
+    if (resp.status === 409 || errText.toLowerCase().includes("name") || errText.toLowerCase().includes("already")) {
+      const fallbackName = `alfred-${randomSuffix()}`;
+      payload.name = fallbackName;
+      resp = await fetch(`${ELEVENLABS_API_BASE}/convai/agents/create`, {
+        method: "POST",
+        headers: { "xi-api-key": apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const errText2 = await resp.text();
+        throw new Error(`Agent creation failed (${resp.status}): ${errText2}`);
+      }
+    } else {
+      throw new Error(`Agent creation failed (${resp.status}): ${errText}`);
+    }
+  }
+
+  const result: any = await resp.json();
+  return {
+    agentId: result.agent_id,
+    agentName: payload.name,
+  };
+}
+
+async function configureAgentWebhook(apiKey: string, agentId: string, webhookUrl: string, webhookSecret?: string): Promise<void> {
+  const webhook: any = { url: webhookUrl };
+  if (webhookSecret) webhook.secret = webhookSecret;
+
+  const resp = await fetch(`${ELEVENLABS_API_BASE}/convai/agents/${agentId}`, {
+    method: "PATCH",
+    headers: { "xi-api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      platform_settings: { webhook },
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Webhook configuration failed (${resp.status}): ${errText}`);
+  }
+}
+
+// ── ngrok Management ─────────────────────────────────────────────
+
+const NGROK_PID_FILE = join(DATA_DIR, "ngrok.pid");
+
+function isNgrokInstalled(): boolean {
+  const result = spawnSync("which", ["ngrok"], { stdio: "pipe", timeout: 5_000 });
+  return result.status === 0;
+}
+
+function installNgrok(): boolean {
+  const platform = process.platform;
+
+  if (platform === "darwin") {
+    // Check if brew exists
+    const brewCheck = spawnSync("which", ["brew"], { stdio: "pipe", timeout: 5_000 });
+    if (brewCheck.status === 0) {
+      console.log("  Installing ngrok via Homebrew...");
+      const result = spawnSync("brew", ["install", "ngrok"], { stdio: "pipe", timeout: 120_000 });
+      if (result.status === 0) return true;
+      console.log(`  Homebrew install failed: ${result.stderr?.toString().trim() || "unknown error"}`);
+    }
+    console.log("  Homebrew not found. Please install ngrok manually: https://ngrok.com/download");
+    return false;
+  }
+
+  if (platform === "linux") {
+    console.log("  Installing ngrok for Linux...");
+    const dl = spawnSync("sh", ["-c",
+      "curl -sL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz -C /usr/local/bin"
+    ], { stdio: "pipe", timeout: 60_000 });
+    if (dl.status === 0) return true;
+    console.log(`  ngrok install failed: ${dl.stderr?.toString().trim() || "unknown error"}`);
+    console.log("  Please install ngrok manually: https://ngrok.com/download");
+    return false;
+  }
+
+  console.log("  Unsupported platform for auto-install. Please install ngrok manually: https://ngrok.com/download");
+  return false;
+}
+
+async function getExistingNgrokTunnel(port: number): Promise<string | null> {
+  try {
+    const resp = await fetch("http://127.0.0.1:4040/api/tunnels");
+    if (!resp.ok) return null;
+    const data: any = await resp.json();
+    for (const tunnel of data.tunnels ?? []) {
+      const addr = tunnel.config?.addr ?? "";
+      if (addr.includes(String(port)) && tunnel.public_url?.startsWith("https://")) {
+        return tunnel.public_url;
+      }
+    }
+  } catch {
+    // ngrok API not running
+  }
+  return null;
+}
+
+function startNgrok(port: number): ChildProcess {
+  const proc = spawn("ngrok", ["http", String(port), "--log=stdout"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+  });
+
+  // Save PID for cleanup
+  if (proc.pid) {
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(NGROK_PID_FILE, String(proc.pid));
+  }
+
+  // Unref so it doesn't block the parent process from exiting
+  proc.unref();
+
+  return proc;
+}
+
+async function waitForNgrokUrl(port: number, timeoutMs: number = 15_000): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const url = await getExistingNgrokTunnel(port);
+    if (url) return url;
+    await new Promise((r) => setTimeout(r, 1_000));
+  }
+  throw new Error("Timed out waiting for ngrok tunnel to be available");
+}
+
+async function setupNgrok(port: number): Promise<string> {
+  // Check for existing tunnel on this port
+  const existing = await getExistingNgrokTunnel(port);
+  if (existing) {
+    console.log(`  Found existing ngrok tunnel: ${existing}`);
+    return existing;
+  }
+
+  // Check if ngrok is installed
+  if (!isNgrokInstalled()) {
+    console.log("  ngrok not found. Attempting to install...");
+    if (!installNgrok()) {
+      throw new Error("ngrok could not be installed. Install manually and re-run setup.");
+    }
+    console.log("  ✓ ngrok installed");
+  }
+
+  // Start ngrok
+  console.log(`  Starting ngrok tunnel on port ${port}...`);
+  startNgrok(port);
+
+  // Wait for tunnel URL
+  const url = await waitForNgrokUrl(port);
+  return url;
+}
+
 // ── Plugin ───────────────────────────────────────────────────────
 
 let webhookProcess: ChildProcess | null = null;
@@ -454,31 +712,103 @@ export default function register(api: any) {
           const zoSecrets = loadZoSecrets();
           const isZo = isZoComputer();
           if (isZo) {
-            console.log("  🖥️  Zo Computer detected — secrets will be saved to /root/.zo_secrets\n");
+            console.log("  Zo Computer detected — secrets will be saved to /root/.zo_secrets\n");
           }
 
-          console.log("  ElevenLabs credentials (from elevenlabs.io dashboard)\n");
+          // ── Step 1: ElevenLabs API Key ──────────────────────────
+          console.log("  Step 1: ElevenLabs API Key\n");
 
           const existingApiKey = existing.elevenlabs?.apiKey || zoSecrets.ELEVENLABS_API_KEY;
-          const apiKey = await ask(
+          const apiKeyInput = await ask(
             "  ElevenLabs API Key",
             existingApiKey ? "••••••" + existingApiKey.slice(-4) : undefined,
           );
-          const agentId = await ask("  ElevenLabs Agent ID", existing.elevenlabs?.agentId || zoSecrets.ELEVENLABS_AGENT_ID);
+          const resolvedApiKey = apiKeyInput.startsWith("••") ? existingApiKey : apiKeyInput;
+
+          if (!resolvedApiKey) {
+            console.log("\n  ✗ API key is required. Aborting setup.");
+            rl.close();
+            return;
+          }
+
+          // ── Step 2: Agent Provisioning ──────────────────────────
+          console.log("\n  Step 2: Agent Provisioning\n");
+
+          const existingAgentId = existing.elevenlabs?.agentId || zoSecrets.ELEVENLABS_AGENT_ID;
+          let agentId: string;
+
+          if (existingAgentId) {
+            const agentInput = await ask(
+              "  Existing Agent ID (or 'new' to create one)",
+              existingAgentId,
+            );
+            if (agentInput === "new") {
+              console.log("  Creating new ElevenLabs agent...");
+              try {
+                const agent = await createElevenLabsAgent(resolvedApiKey);
+                agentId = agent.agentId;
+                console.log(`  ✓ Agent '${agent.agentName}' created (${agentId})`);
+              } catch (err: any) {
+                console.log(`  ✗ Agent creation failed: ${err.message}`);
+                rl.close();
+                return;
+              }
+            } else {
+              agentId = agentInput;
+            }
+          } else {
+            console.log("  No existing agent found. Creating one...");
+            try {
+              const agent = await createElevenLabsAgent(resolvedApiKey);
+              agentId = agent.agentId;
+              console.log(`  ✓ Agent '${agent.agentName}' created (${agentId})`);
+            } catch (err: any) {
+              console.log(`  ✗ Agent creation failed: ${err.message}`);
+              rl.close();
+              return;
+            }
+          }
+
+          // ── Step 3: Phone Number (optional) ─────────────────────
+          console.log("\n  Step 3: Phone Number (optional)\n");
+
           const phoneNumberId = await ask(
             "  ElevenLabs Phone Number ID",
             existing.elevenlabs?.phoneNumberId || zoSecrets.ELEVENLABS_PHONE_NUMBER_ID || "skip",
           );
 
-          console.log("\n  Webhook settings\n");
+          // ── Step 4: Webhook Setup ───────────────────────────────
+          console.log("\n  Step 4: Webhook Setup\n");
 
           const webhookPort = await ask("  Webhook server port", String(existing.webhook?.port ?? 8770));
+          const wPort = parseInt(webhookPort) || 8770;
           const webhookSecret = await ask(
             "  Webhook signing secret",
             existing.webhook?.secret ? "••••••" : "skip",
           );
+          const resolvedWebhookSecret = (webhookSecret && webhookSecret !== "skip" && !webhookSecret.startsWith("••"))
+            ? webhookSecret
+            : existing.webhook?.secret || undefined;
 
-          console.log("\n  Transcript processing\n");
+          console.log("\n  Setting up webhook tunnel...");
+          let ngrokUrl: string | null = null;
+          try {
+            ngrokUrl = await setupNgrok(wPort);
+            const fullWebhookUrl = `${ngrokUrl}/elevenlabs-webhook`;
+            console.log(`  ✓ ngrok tunnel active: ${ngrokUrl}`);
+
+            // Configure webhook in ElevenLabs
+            console.log("  Configuring webhook in ElevenLabs...");
+            await configureAgentWebhook(resolvedApiKey, agentId, fullWebhookUrl, resolvedWebhookSecret);
+            console.log(`  ✓ Webhook configured: ${fullWebhookUrl}`);
+          } catch (err: any) {
+            console.log(`  ⚠ Webhook auto-setup failed: ${err.message}`);
+            console.log(`  You can configure the webhook manually later.`);
+            console.log(`  Set the webhook URL to: <your-public-url>/elevenlabs-webhook`);
+          }
+
+          // ── Step 5: Transcript processing ───────────────────────
+          console.log("\n  Step 5: Transcript processing\n");
 
           const inboxDir = await ask("  Vault inbox directory", existing.transcripts?.inboxDir || "~/vault/inbox");
           const summaryModel = await ask(
@@ -486,14 +816,15 @@ export default function register(api: any) {
             existing.transcripts?.summaryModel || "anthropic/claude-haiku-4-5",
           );
 
-          console.log("\n  Contacts (phone → name mapping)\n");
+          // ── Step 6: Contacts (optional) ─────────────────────────
+          console.log("\n  Step 6: Contacts (phone → name mapping)\n");
 
           const contacts: Record<string, string> = { ...(existing.contacts ?? {}) };
           let addMore = true;
           if (Object.keys(contacts).length > 0) {
             console.log("  Existing contacts:");
-            for (const [phone, name] of Object.entries(contacts)) {
-              console.log(`    ${phone} → ${name}`);
+            for (const [phone, cname] of Object.entries(contacts)) {
+              console.log(`    ${phone} → ${cname}`);
             }
             console.log("");
           }
@@ -507,14 +838,16 @@ export default function register(api: any) {
             }
           }
 
-          // Build config
+          // ── Save config ─────────────────────────────────────────
+          console.log("\n  Saving configuration...\n");
+
           const pluginConfig: any = {
             elevenlabs: {
-              apiKey: apiKey.startsWith("••") ? existing.elevenlabs?.apiKey : apiKey,
+              apiKey: resolvedApiKey,
               agentId: agentId,
             },
             webhook: {
-              port: parseInt(webhookPort) || 8770,
+              port: wPort,
             },
             transcripts: {
               inboxDir: inboxDir,
@@ -525,10 +858,8 @@ export default function register(api: any) {
           if (phoneNumberId && phoneNumberId !== "skip") {
             pluginConfig.elevenlabs.phoneNumberId = phoneNumberId;
           }
-          if (webhookSecret && webhookSecret !== "skip" && !webhookSecret.startsWith("••")) {
-            pluginConfig.webhook.secret = webhookSecret;
-          } else if (existing.webhook?.secret) {
-            pluginConfig.webhook.secret = existing.webhook.secret;
+          if (resolvedWebhookSecret) {
+            pluginConfig.webhook.secret = resolvedWebhookSecret;
           }
           if (Object.keys(contacts).length > 0) {
             pluginConfig.contacts = contacts;
@@ -544,50 +875,23 @@ export default function register(api: any) {
 
           try {
             writeFileSync(configPath, JSON.stringify(fullConfig, null, 2) + "\n");
-            console.log("\n  ✓ Configuration saved to ~/.openclaw/openclaw.json");
+            console.log("  ✓ Configuration saved to ~/.openclaw/openclaw.json");
           } catch (err: any) {
-            console.error(`\n  ✗ Failed to save config: ${err.message}`);
+            console.error(`  ✗ Failed to save config: ${err.message}`);
             console.log("\n  Config to add manually:\n");
             console.log(JSON.stringify({ "alfred-talk": { enabled: true, config: pluginConfig } }, null, 2));
           }
 
           // Save secrets to Zo Computer if available
           if (isZo) {
-            const resolvedApiKey = pluginConfig.elevenlabs.apiKey;
             if (resolvedApiKey) saveZoSecret("ELEVENLABS_API_KEY", resolvedApiKey);
-            if (pluginConfig.elevenlabs.agentId) saveZoSecret("ELEVENLABS_AGENT_ID", pluginConfig.elevenlabs.agentId);
+            if (agentId) saveZoSecret("ELEVENLABS_AGENT_ID", agentId);
             if (pluginConfig.elevenlabs.phoneNumberId) saveZoSecret("ELEVENLABS_PHONE_NUMBER_ID", pluginConfig.elevenlabs.phoneNumberId);
-            if (pluginConfig.webhook?.secret) saveZoSecret("ELEVENLABS_WEBHOOK_SECRET", pluginConfig.webhook.secret);
+            if (resolvedWebhookSecret) saveZoSecret("ELEVENLABS_WEBHOOK_SECRET", resolvedWebhookSecret);
             console.log("  ✓ Secrets saved to /root/.zo_secrets");
           }
 
-          // Detect machine IP
-          let machineIp = "localhost";
-          try {
-            const tsResult = spawnSync("tailscale", ["ip", "-4"], { stdio: "pipe", timeout: 5_000 });
-            if (tsResult.status === 0) {
-              machineIp = tsResult.stdout?.toString().trim().split("\n")[0] || machineIp;
-            } else {
-              const hostResult = spawnSync("hostname", ["-I"], { stdio: "pipe", timeout: 5_000 });
-              if (hostResult.status === 0) {
-                machineIp = hostResult.stdout?.toString().trim().split(" ")[0] || machineIp;
-              } else {
-                const ifResult = spawnSync("sh", ["-c", "ifconfig | grep 'inet ' | grep -v 127.0.0.1 | head -1 | awk '{print $2}'"], { stdio: "pipe", timeout: 5_000 });
-                if (ifResult.status === 0) {
-                  machineIp = ifResult.stdout?.toString().trim() || machineIp;
-                }
-              }
-            }
-          } catch {}
-
-          const wPort = parseInt(webhookPort) || 8770;
-          console.log("\n  Next steps:");
-          console.log("  1. Restart gateway: openclaw gateway restart");
-          console.log(`  2. Expose webhook publicly (ElevenLabs needs to reach it)`);
-          console.log(`     Option A: ngrok http ${wPort}`);
-          console.log(`     Option B: tailscale funnel ${wPort} (if on tailnet)`);
-          console.log(`     Local URL: http://${machineIp}:${wPort}/elevenlabs-webhook`);
-          console.log("  3. Paste the public URL into ElevenLabs Agent → Webhook Settings");
+          console.log("\n  ✓ Ready! Restart gateway: openclaw gateway restart");
           console.log("");
 
           rl.close();

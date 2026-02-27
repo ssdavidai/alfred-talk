@@ -1,6 +1,6 @@
 {
   "name": "alfred-talk",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "OpenClaw plugin for ElevenLabs voice agent — outbound AI phone calls with context-aware prompting and transcript processing",
   "main": "index.ts",
   "openclaw": {
