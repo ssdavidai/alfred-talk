@@ -1,0 +1,55 @@
+{
+  "id": "alfred-talk",
+  "name": "Alfred Talk",
+  "description": "ElevenLabs voice agent integration for OpenClaw — outbound AI phone calls with context-aware prompting and automatic transcript processing",
+  "version": "1.0.0",
+  "skills": ["./skills/voice-calls"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "elevenlabs": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "apiKey": { "type": "string" },
+          "agentId": { "type": "string" },
+          "phoneNumberId": { "type": "string" }
+        }
+      },
+      "webhook": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "port": { "type": "number", "default": 8770 },
+          "secret": { "type": "string" }
+        }
+      },
+      "transcripts": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "dir": { "type": "string" },
+          "inboxDir": { "type": "string" },
+          "summaryModel": { "type": "string", "default": "anthropic/claude-haiku-4-5" }
+        }
+      },
+      "contacts": {
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Phone number to name mapping, e.g. { \"+36701234567\": \"Mom\" }"
+      }
+    }
+  },
+  "uiHints": {
+    "elevenlabs.apiKey": { "label": "ElevenLabs API Key", "sensitive": true },
+    "elevenlabs.agentId": { "label": "ElevenLabs Agent ID", "placeholder": "agent_xxxx" },
+    "elevenlabs.phoneNumberId": { "label": "ElevenLabs Phone Number ID", "placeholder": "phnum_xxxx" },
+    "webhook.port": { "label": "Webhook Server Port", "placeholder": "8770" },
+    "webhook.secret": { "label": "ElevenLabs Webhook Secret", "sensitive": true },
+    "transcripts.dir": { "label": "Transcript Storage Directory", "placeholder": "~/.openclaw/alfred-talk/transcripts" },
+    "transcripts.inboxDir": { "label": "Vault Inbox Directory", "placeholder": "~/vault/inbox" },
+    "transcripts.summaryModel": { "label": "Summary Model", "placeholder": "anthropic/claude-haiku-4-5" },
+    "contacts": { "label": "Phone → Name Contacts Map" }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "alfred-talk",
+  "version": "1.6.0",
+  "description": "OpenClaw plugin for ElevenLabs voice agent — outbound AI phone calls with context-aware prompting and transcript processing",
+  "main": "index.ts",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "webhook-server/",
+    "skills/",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": ["openclaw", "openclaw-plugin", "elevenlabs", "voice", "phone", "butler", "ai-agent"],
+  "author": "ssdavidai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ssdavidai/alfred-talk.git"
+  },
+  "homepage": "https://github.com/ssdavidai/alfred-talk"
+}
